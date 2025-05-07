@@ -509,11 +509,14 @@ def run_lighthouse(url, retries=3, delay=2):
     for attempt in range(retries):
         try:
             subprocess.run([
-                "lighthouse", url,
-                "--quiet",
-                "--chrome-flags='--headless'",
-                "--output=json", "--output-path=report.json"
-            ], check=True)
+    "lighthouse", url,
+    "--quiet",
+    "--chrome-flags=--headless --disable-gpu --no-sandbox --window-size=412,823",
+    "--preset=mobile",
+    "--output=json",
+    "--output-path=report.json"
+], check=True)
+
             with open("report.json", "r") as f:
                 report = json.load(f)
             return extract_metrics(report)
