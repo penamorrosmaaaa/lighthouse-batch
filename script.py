@@ -8,8 +8,22 @@ import datetime
 import gspread
 import time
 import subprocess
+import logging
 from oauth2client.service_account import ServiceAccountCredentials
 from lxml import etree
+
+# ----------------------------------------------------------------
+# Setup Logging
+# ----------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('sitemap_extractor.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # ----------------------------------------------------------------
 # Setup Google Sheets API
@@ -18,44 +32,74 @@ SHEET_NAME = "SITEMAPS.XML"
 WORKSHEET_NAME = "Sheet1"
 CREDENTIALS_FILE = "credentials.json"
 
-scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
-client = gspread.authorize(creds)
-sheet = client.open(SHEET_NAME).worksheet(WORKSHEET_NAME)
+try:
+    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
+    client = gspread.authorize(creds)
+    sheet = client.open(SHEET_NAME).worksheet(WORKSHEET_NAME)
+    logger.info("Successfully connected to Google Sheets")
+except Exception as e:
+    logger.error(f"Failed to connect to Google Sheets: {str(e)}")
+    raise
 
 today = datetime.datetime.today().strftime("%Y-%m-%d")
 
-# Load all used URLs from the sheet (to avoid duplicates)
+# Solo evitamos repetir URLs dentro de esta corrida, no de semanas anteriores
 used_urls = set()
-for row in sheet.get_all_values():
-    for cell in row:
-        if cell.startswith("http"):
-            used_urls.add(cell.strip())
 
 # ----------------------------------------------------------------
 # HTTP Helpers
 # ----------------------------------------------------------------
-def safe_request(url, retries=3, delay=2):
-    for attempt in range(retries):
+# ----------------------------------------------------------------
+# HTTP Helpers (with longer waits & retries)
+# ----------------------------------------------------------------
+def safe_request(url, retries=5, delay=5, timeout=10):
+    """
+    Try up to `retries` times, waiting `delay` seconds between attempts,
+    before giving up on fetching url.
+    """
+    for attempt in range(1, retries + 1):
         try:
-            resp = requests.get(url, timeout=10)
+            resp = requests.get(url, timeout=timeout)
             if resp.status_code == 200:
+                logger.debug(f"[{attempt}/{retries}] Fetched {url}")
                 return resp
-        except Exception:
-            pass
+            else:
+                logger.warning(f"[{attempt}/{retries}] {url} returned {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"[{attempt}/{retries}] Error fetching {url}: {e}")
         time.sleep(delay)
+    logger.error(f"All {retries} attempts failed for {url}")
     return None
 
-def fetch_xml_root(url):
-    resp = safe_request(url)
-    if not resp:
-        return None
-    data = resp.content
-    try:
-        data = gzip.GzipFile(fileobj=io.BytesIO(data)).read()
-    except (OSError, gzip.BadGzipFile):
-        pass
-    return etree.fromstring(data)
+def fetch_xml_root(url, retries=5, delay=5):
+    """
+    Use safe_request to fetch, then attempt to parse XML—and if parse fails,
+    retry the whole fetch→parse cycle up to `retries` times.
+    """
+    for attempt in range(1, retries + 1):
+        resp = safe_request(url, retries=1, delay=0)
+        if not resp:
+            logger.warning(f"[{attempt}/{retries}] No response for XML at {url}")
+        else:
+            data = resp.content
+            # try decompressing
+            try:
+                data = gzip.GzipFile(fileobj=io.BytesIO(data)).read()
+                logger.debug("Gzipped feed, decompressed successfully")
+            except (OSError, gzip.BadGzipFile):
+                pass
+            # try parse
+            try:
+                root = etree.fromstring(data)
+                logger.info(f"[{attempt}/{retries}] Parsed XML from {url}")
+                return root
+            except Exception as e:
+                logger.warning(f"[{attempt}/{retries}] Failed to parse XML: {e}")
+        time.sleep(delay)
+    logger.error(f"Failed to fetch & parse XML from {url} after {retries} attempts")
+    return None
+
 
 # ----------------------------------------------------------------
 # Generic Extractors
@@ -113,30 +157,80 @@ def get_milenio():
     ns = {"ns": "http://www.sitemaps.org/schemas/sitemap/0.9"}
     nota, video = [], []
     for loc in root.xpath("//ns:url/ns:loc", namespaces=ns):
-        url = loc.text.strip()
-        is_video = url.endswith("-video") or "/video/" in url or url.split("/")[-1] == "video"
+        url = loc.text.strip().lower()
+        is_video = (
+            url.endswith("-video") or 
+            "/video/" in url or 
+            url.split("/")[-1] == "video" or
+            "videos" in url or
+            "videogallery" in url
+        )
         (video if is_video else nota).append(url)
     return nota, video
 
 def get_as():
-    resp = safe_request("https://feeds.as.com/mrss-s/pages/as/site/as.com/section/opinion/portada/")
-    text = resp.text if resp else ""
-    nota = re.findall(r'https?://as\.com[^\s"<]+', text)
-    nota = [u for u in nota if "/opinion/" in u and "video" not in u]
-    resp2 = safe_request("https://feeds.as.com/mrss-s/list/as/site/as.com/video/")
-    text2 = resp2.text if resp2 else ""
-    video = re.findall(r'https?://as\.com[^\s"<]+', text2)
-    video = [u for u in video if "video" in u]
+    """
+    Parses the AS MRSS feeds:
+     • Opinion feed for nota → <item><link>
+     • Video feed for video → <item><media:content url="…">
+    """
+    nota, video = [], []
+
+    # 1) NOTA: opinion articles
+    nota_feed = "https://feeds.as.com/mrss-s/pages/as/site/as.com/section/opinion/portada/"
+    root_n = fetch_xml_root(nota_feed)
+    if root_n is None:
+        logger.error("Failed to fetch AS nota feed")
+    else:
+        for item in root_n.xpath("//item"):
+            link = item.find("link")
+            if link is not None and link.text:
+                nota.append(link.text.strip())
+        logger.info(f"AS NOTA: found {len(nota)} URLs")
+
+    # 2) VIDEO: MRSS video feed
+    video_feed = "https://feeds.as.com/mrss-s/list/as/site/as.com/video/"
+    root_v = fetch_xml_root(video_feed)
+    if root_v is None:
+        logger.error("Failed to fetch AS video feed")
+    else:
+        ns = {"media": "http://search.yahoo.com/mrss/"}
+        for media in root_v.xpath("//item/media:content", namespaces=ns):
+            url = media.get("url")
+            if url:
+                video.append(url.strip())
+        logger.info(f"AS VIDEO: found {len(video)} URLs")
+
     return nota, video
 
+
 def get_terra():
-    resp = safe_request("https://www.terra.com.mx/rss/un_foto.html")
+    """
+    Fetch Terra’s un_foto feed and return two lists:
+      - nota: URLs under /nacionales/
+      - video: URLs under /entretenimiento/
+    """
+    feed_url = "https://www.terra.com.mx/rss/un_foto.html"
+    resp = safe_request(feed_url)
     if not resp:
+        logger.error("Failed to fetch Terra feed")
         return [], []
-    urls = re.findall(r"https?://www\.terra\.com\.mx[^\s\"<]+", resp.text)
-    nota = [u for u in urls if "/nacionales/" in u]
-    video = [u for u in urls if "/entretenimiento/" in u]
+
+    text = resp.text
+    # grab all terra.com.mx URLs
+    all_urls = re.findall(r"https?://www\.terra\.com\.mx[^\s\"<]+", text)
+
+    # filter by section
+    nota  = [u for u in all_urls if "/nacionales/" in u]
+    video = [u for u in all_urls if "/entretenimiento/" in u]
+
+    # dedupe while preserving order
+    nota  = list(dict.fromkeys(nota))
+    video = list(dict.fromkeys(video))
+
+    logger.info(f"Terra: {len(nota)} nota URLs, {len(video)} video URLs")
     return nota, video
+
 
 def get_nytimes():
     nota = extract_urls_from_xml("https://www.nytimes.com/sitemaps/new/news.xml.gz")
@@ -157,8 +251,14 @@ def get_infobae():
 
 def get_universal():
     all_urls = extract_urls_from_xml("https://www.eluniversal.com.mx/arc/outboundfeeds/general/?outputType=xml")
-    nota = [u for u in all_urls if not any(v in u for v in ["/video/", "/videos/", "-video"])]
-    video = [u for u in all_urls if any(v in u for v in ["/video/", "/videos/", "-video"])]
+    nota = []
+    video = []
+    for url in all_urls:
+        lower_url = url.lower()
+        if any(v in lower_url for v in ["/video/", "/videos/", "-video", "videogaleria"]):
+            video.append(url)
+        else:
+            nota.append(url)
     return nota, video
 
 def get_televisa():
@@ -174,108 +274,104 @@ def get_tvazteca(nota_url, video_url):
 # ----------------------------------------------------------------
 # Company map
 # ----------------------------------------------------------------
-# ----------------------------------------------------------------
-# Company map (store functions, not their outputs)
-# ----------------------------------------------------------------
 companies = {
-    "Heraldo": get_heraldo,
-    "Televisa": get_televisa,
-    "Milenio": get_milenio,
-    "Universal": get_universal,
-    "As": get_as,
-    "Infobae": get_infobae,
-    "NyTimes": get_nytimes,
-    "Terra": get_terra,
-    "Azteca 7": lambda: get_tvazteca(
+    "Heraldo": get_heraldo(),
+    "Televisa": get_televisa(),
+    "Milenio": get_milenio(),
+    "Universal": get_universal(),
+    "As": get_as(),
+    "Infobae": get_infobae(),
+    "NyTimes": get_nytimes(),
+    "Terra": get_terra(),
+    "Azteca 7": get_tvazteca(
         "https://www.tvazteca.com/azteca7/newslatest-sitemap-latest.xml",
         "https://www.tvazteca.com/azteca7/video-sitemap-latest.xml"
     ),
-    "Azteca UNO": lambda: get_tvazteca(
+    "Azteca UNO": get_tvazteca(
         "https://www.tvazteca.com/aztecauno/newslatest-sitemap-latest.xml",
         "https://www.tvazteca.com/aztecauno/video-sitemap-latest.xml"
     ),
-    "ADN40": lambda: get_tvazteca(
+    "ADN40": get_tvazteca(
         "https://www.adn40.mx/newslatest-sitemap-latest.xml",
         "https://www.adn40.mx/video-sitemap-latest.xml"
     ),
-    "Deportes": lambda: get_tvazteca(
+    "Deportes": get_tvazteca(
         "https://www.tvazteca.com/aztecadeportes/newslatest-sitemap-latest.xml",
         "https://www.tvazteca.com/aztecadeportes/video-sitemap-latest.xml"
     ),
-    "A+": lambda: get_tvazteca(
+    "A+": get_tvazteca(
         "https://www.tvazteca.com/amastv/newslatest-sitemap-latest.xml",
         "https://www.tvazteca.com/amastv/video-sitemap-latest.xml"
     ),
-    "Noticias": lambda: get_tvazteca(
+    "Noticias": get_tvazteca(
         "https://www.tvazteca.com/aztecanoticias/newslatest-sitemap-latest.xml",
         "https://www.tvazteca.com/aztecanoticias/video-sitemap-latest.xml"
     ),
-    "Quintana Roo": lambda: get_tvazteca(
+    "Quintana Roo": get_tvazteca(
         "https://www.aztecaquintanaroo.com//newslatest-sitemap-latest.xml",
         "https://www.aztecaquintanaroo.com//video-sitemap-latest.xml"
     ),
-    "Bajío": lambda: get_tvazteca(
+    "Bajío": get_tvazteca(
         "https://www.aztecabajio.com//newslatest-sitemap-latest.xml",
         "https://www.aztecabajio.com//video-sitemap-latest.xml"
     ),
-    "Ciudad Juárez": lambda: get_tvazteca(
+    "Ciudad Juárez": get_tvazteca(
         "https://www.aztecaciudadjuarez.com//newslatest-sitemap-latest.xml",
         "https://www.aztecaciudadjuarez.com//video-sitemap-latest.xml"
     ),
-    "Yúcatan": lambda: get_tvazteca(
+    "Yúcatan": get_tvazteca(
         "https://www.aztecayucatan.com//newslatest-sitemap-latest.xml",
         "https://www.aztecayucatan.com//video-sitemap-latest.xml"
     ),
-    "Jalisco": lambda: get_tvazteca(
+    "Jalisco": get_tvazteca(
         "https://www.aztecajalisco.com//newslatest-sitemap-latest.xml",
         "https://www.aztecajalisco.com//video-sitemap-latest.xml"
     ),
-    "Puebla": lambda: get_tvazteca(
+    "Puebla": get_tvazteca(
         "https://www.aztecapuebla.com//newslatest-sitemap-latest.xml",
         "https://www.aztecapuebla.com//video-sitemap-latest.xml"
     ),
-    "Veracruz": lambda: get_tvazteca(
+    "Veracruz": get_tvazteca(
         "https://www.aztecaveracruz.com//newslatest-sitemap-latest.xml",
         "https://www.aztecaveracruz.com//video-sitemap-latest.xml"
     ),
-    "Baja California": lambda: get_tvazteca(
+    "Baja California": get_tvazteca(
         "https://www.tvaztecabajacalifornia.com//newslatest-sitemap-latest.xml",
         "https://www.tvaztecabajacalifornia.com//video-sitemap-latest.xml"
     ),
-    "Morelos": lambda: get_tvazteca(
+    "Morelos": get_tvazteca(
         "https://www.aztecamorelos.com//newslatest-sitemap-latest.xml",
         "https://www.aztecamorelos.com//video-sitemap-latest.xml"
     ),
-    "Guerrero": lambda: get_tvazteca(
+    "Guerrero": get_tvazteca(
         "https://www.aztecaguerrero.com//newslatest-sitemap-latest.xml",
         "https://www.aztecaguerrero.com//video-sitemap-latest.xml"
     ),
-    "Chiapas": lambda: get_tvazteca(
+    "Chiapas": get_tvazteca(
         "https://www.aztecachiapas.com//newslatest-sitemap-latest.xml",
         "https://www.aztecachiapas.com//video-sitemap-latest.xml"
     ),
-    "Sinaloa": lambda: get_tvazteca(
+    "Sinaloa": get_tvazteca(
         "https://www.aztecasinaloa.com//newslatest-sitemap-latest.xml",
         "https://www.aztecasinaloa.com//video-sitemap-latest.xml"
     ),
-    "Aguascalientes": lambda: get_tvazteca(
+    "Aguascalientes": get_tvazteca(
         "https://www.aztecaaguascalientes.com//newslatest-sitemap-latest.xml",
         "https://www.aztecaaguascalientes.com//video-sitemap-latest.xml"
     ),
-    "Queretaro": lambda: get_tvazteca(
+    "Queretaro": get_tvazteca(
         "https://www.aztecaqueretaro.com//newslatest-sitemap-latest.xml",
         "https://www.aztecaqueretaro.com//video-sitemap-latest.xml"
     ),
-    "Chihuahua": lambda: get_tvazteca(
+    "Chihuahua": get_tvazteca(
         "https://www.aztecachihuahua.com//newslatest-sitemap-latest.xml",
         "https://www.aztecachihuahua.com//video-sitemap-latest.xml"
     ),
-    "Laguna": lambda: get_tvazteca(
+    "Laguna": get_tvazteca(
         "https://www.aztecalaguna.com//newslatest-sitemap-latest.xml",
         "https://www.aztecalaguna.com//video-sitemap-latest.xml"
     ),
 }
-
 
 # ----------------------------------------------------------------
 # Gallery extractor for specific image sitemaps
@@ -310,67 +406,87 @@ gallery_sitemaps = {
 # Pre‐fetch gallery URLs
 gallery_urls_map = {}
 for key, url in gallery_sitemaps.items():
-    _, galleries = extract_gallery_urls(url)
-    gallery_urls_map[key] = galleries
-
-# ----------------------------------------------------------------
-# Push new unique rows (horizontal, 9 columns per entry)
-# ----------------------------------------------------------------
-company_counters = {}
-company_cache = {}
-
-for name, extractor in companies.items():
     try:
-        nota, video = extractor()
-        print(f"✅ {name}: {len(nota)} NOTA, {len(video)} VIDEO URLs extracted")
+        _, galleries = extract_gallery_urls(url)
+        gallery_urls_map[key] = galleries
+        logger.info(f"Found {len(galleries)} gallery URLs for {key}")
     except Exception as e:
-        nota, video = [], []
-        print(f"❌ {name}: Extraction failed – {e}")
-    company_cache[name] = {"nota": nota, "video": video}
-    company_counters[name] = 0
+        logger.error(f"Failed to extract gallery URLs for {key}: {str(e)}")
+        gallery_urls_map[key] = []
 
-gallery_counters = {name: 0 for name in gallery_sitemaps}
-max_new = 10
+# ----------------------------------------------------------------
+# Push new rows, one horizontal entry per company (nota, video, img)
+# ----------------------------------------------------------------
+try:
+    max_rows = 10  # up to 10 entries of each type
+    content_types = ["nota", "video"]
 
-for content_type in ["nota", "video"]:
-    for _ in range(max_new):
-        row = []
-        skip = True
+    for content_type in content_types:
+        logger.info(f"⏩ Building up to {max_rows} rows for {content_type}")
+        for i in range(max_rows):
+            row = []
+            any_url = False
 
-        for comp in companies:
-            urls = company_cache[comp][content_type]
-            inserted = False
-            while company_counters[comp] < len(urls):
-                candidate = urls[company_counters[comp]]
-                company_counters[comp] += 1
-                if candidate not in used_urls:
-                    print(f"➕ New {content_type.upper()} for {comp}: {candidate}")
-                    row.extend([today, content_type, candidate, "", "", "", "", "", ""])
-                    used_urls.add(candidate)
-                    inserted = True
-                    skip = False
-                    break
-            if not inserted:
-                row.extend(["", "", "", "", "", "", "", "", ""])
+            # 1) News/video URLs from each company
+            for comp, (nota_list, video_list) in companies.items():
+                urls = nota_list if content_type == "nota" else video_list
 
-        for gal_name, galleries in gallery_urls_map.items():
-            if gallery_counters[gal_name] < len(galleries):
-                candidate = galleries[gallery_counters[gal_name]]
-                gallery_counters[gal_name] += 1
-                if candidate not in used_urls:
-                    print(f"➕ New GALLERY from {gal_name}: {candidate}")
-                    row.extend([today, "img", candidate, "", "", "", "", "", ""])
-                    used_urls.add(candidate)
-                    skip = False
+                if i < len(urls):
+                    url = urls[i]
+                    if url not in used_urls:
+                        row.extend([today, content_type, url] + [""] * 6)
+                        used_urls.add(url)
+                        any_url = True
+                    else:
+                        # Ya se usó en esta corrida (no en semanas pasadas), se deja vacío
+                        row.extend([""] * 9)
                 else:
-                    row.extend(["", "", "", "", "", "", "", "", ""])
-            else:
-                row.extend(["", "", "", "", "", "", "", "", ""])
+                    # No hay suficientes nuevas, repetir la última si existe
+                    if len(urls) > 0:
+                        last_url = urls[-1]
+                        if last_url not in used_urls:
+                            row.extend([today, content_type, last_url] + [""] * 6)
+                            used_urls.add(last_url)
+                            any_url = True
+                        else:
+                            row.extend([""] * 9)
+                    else:
+                        row.extend([""] * 9)
 
-        if not skip:
-            sheet.append_row(row)
+            # 2) Gallery URLs
+            for gal_key, galleries in gallery_urls_map.items():
+                if i < len(galleries):
+                    url = galleries[i]
+                    if url not in used_urls:
+                        row.extend([today, "img", url] + [""] * 6)
+                        used_urls.add(url)
+                        any_url = True
+                    else:
+                        row.extend([""] * 9)
+                else:
+                    if len(galleries) > 0:
+                        last_url = galleries[-1]
+                        if last_url not in used_urls:
+                            row.extend([today, "img", last_url] + [""] * 6)
+                            used_urls.add(last_url)
+                            any_url = True
+                        else:
+                            row.extend([""] * 9)
+                    else:
+                        row.extend([""] * 9)
 
-print("✅ Final rows pushed (no duplicates), including galleries.")
+            # Append the row
+            if any_url:
+                try:
+                    sheet.append_row(row)
+                    logger.info(f"✅ Appended row #{i+1} for {content_type}")
+                except Exception as e:
+                    logger.error(f"❌ Failed to append row #{i+1}: {e}")
+
+except Exception as e:
+    logger.error(f"🔥 Error in main processing loop: {str(e)}")
+    raise
+
 
 
 
@@ -401,36 +517,50 @@ def run_lighthouse(url, retries=3, delay=2):
             with open("report.json", "r") as f:
                 report = json.load(f)
             return extract_metrics(report)
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Lighthouse attempt {attempt + 1} failed for {url}: {str(e)}")
             time.sleep(delay)
     return None
 
 # ----------------------------------------------------------------
-# Iterate through sheet rows and test pending URLs
+# Full Lighthouse loop (real runs + sheet updates)
 # ----------------------------------------------------------------
-all_rows = sheet.get_all_values()
-for row_idx, row in enumerate(all_rows, start=1):
-    if len(row) < 9:
-        continue
-    content_type = row[1].lower()
-    url = row[2].strip()
-    score_cell = row[3].strip()
+try:
+    all_rows = sheet.get_all_values()
+    logger.info(f"Found {len(all_rows)} rows to process for Lighthouse")
 
-    if content_type in ("nota", "video", "img") and url.startswith("http") and score_cell == "":
-        print(f"🚀 Running Lighthouse test for {content_type.upper()} URL: {url}")
-        metrics = run_lighthouse(url, retries=3, delay=2)
-        if metrics:
-            print(f"✅ Lighthouse Success for {url} — Score: {metrics['score']}")
-            sheet.update_cell(row_idx, 4, metrics["score"])
-            sheet.update_cell(row_idx, 5, metrics["cls"])
-            sheet.update_cell(row_idx, 6, metrics["lcp"])
-            sheet.update_cell(row_idx, 7, metrics["si"])
-            sheet.update_cell(row_idx, 8, metrics["tbt"])
-            sheet.update_cell(row_idx, 9, metrics["fcp"])
-        else:
-            print(f"❌ Lighthouse Failed for {url}")
-        time.sleep(1)
+    for row_idx, row in enumerate(all_rows, start=1):
+        groups = len(row) // 9
 
-print("✅ URLs written and Lighthouse tests completed.")
+        for g in range(groups):
+            base = g * 9
+            content_type = row[base + 1].strip().lower()
+            url          = row[base + 2].strip()
+            score_cell   = row[base + 3].strip()
 
+            if content_type in ("nota", "video", "img") and url.startswith("http") and score_cell == "":
+                logger.info(f"Running Lighthouse for {content_type} URL: {url}")
+                metrics = run_lighthouse(url, retries=3, delay=2)
 
+                if metrics:
+                    try:
+                        # base+4 is the “Score” column in this group
+                        sheet.update_cell(row_idx, base + 4, metrics["score"])
+                        sheet.update_cell(row_idx, base + 5, metrics["cls"])
+                        sheet.update_cell(row_idx, base + 6, metrics["lcp"])
+                        sheet.update_cell(row_idx, base + 7, metrics["si"])
+                        sheet.update_cell(row_idx, base + 8, metrics["tbt"])
+                        sheet.update_cell(row_idx, base + 9, metrics["fcp"])
+                        logger.info(f"Updated metrics for row {row_idx}, group {g+1}")
+                    except Exception as e:
+                        logger.error(f"Failed to update metrics at row {row_idx}, group {g+1}: {e}")
+                else:
+                    logger.warning(f"Failed to get Lighthouse metrics for {url}")
+
+                # throttle between runs
+                time.sleep(1)
+
+    logger.info("✅ URLs written and Lighthouse tests completed.")
+except Exception as e:
+    logger.error(f"Error in Lighthouse processing: {e}")
+    raise
