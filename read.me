@@ -1,0 +1,120 @@
+from pathlib import Path
+
+# Contenido completo del README.md
+readme_content = """\
+## 🔐 Cómo usar `credentials.json` de forma segura en AWS (sin exponerlo en GitHub)
+
+Este proyecto requiere un archivo `credentials.json` con credenciales de Google Cloud para funcionar correctamente. **Por razones de seguridad, este archivo no debe subirse al repositorio de GitHub**.
+
+Sigue estos pasos para ejecutar el script de forma segura en una instancia EC2 de AWS, dejándolo siempre corriendo con `tmux`, y programando su ejecución todos los domingos a las 12:00 a.m.
+
+---
+
+### ✅ Pasos para ejecutar el script en AWS EC2
+
+---
+
+### 1. Lanza una instancia EC2
+
+- Usa **Ubuntu 20.04** o **Amazon Linux 2**
+- Asegúrate de abrir el **puerto 22 (SSH)** en el grupo de seguridad
+- Ten listo tu archivo `.pem` para conectarte vía SSH
+
+---
+
+### 2. Conéctate por SSH a tu instancia
+
+Desde tu computadora local (Mac o Linux):
+
+```bash
+ssh -i ruta/a/tu-clave.pem ec2-user@IP-de-tu-ec2
+Reemplaza ruta/a/tu-clave.pem por la ruta a tu archivo .pem, y IP-de-tu-ec2 por la dirección IP pública de tu instancia.
+
+3. Instala Python, Git, tmux y otras herramientas necesarias
+bash
+Always show details
+
+Copy
+sudo apt update && sudo apt install -y python3 python3-pip git tmux
+4. Clona este repositorio
+bash
+Always show details
+
+Copy
+git clone https://github.com/penamorrosmaaaa/lighthouse-batch.git
+cd lighthouse-batch
+5. Sube tu archivo credentials.json directamente al servidor
+Desde tu computadora local:
+
+bash
+Always show details
+
+Copy
+scp -i ruta/a/tu-clave.pem ruta/a/credentials.json ec2-user@IP-de-tu-ec2:/home/ec2-user/lighthouse-batch/
+Asegúrate de que el archivo quede en la misma carpeta que el script (lighthouse-batch).
+
+6. Instala las dependencias de Python
+bash
+Always show details
+
+Copy
+pip3 install -r requirements.txt
+7. Ejecuta el script dentro de tmux (para que siempre quede activo)
+1. Inicia una nueva sesión de tmux (puedes darle un nombre como lighthouse):
+bash
+Always show details
+
+Copy
+tmux new -s lighthouse
+2. Dentro de esa sesión, ejecuta el script:
+bash
+Always show details
+
+Copy
+python3 script.py
+Ahora el script está corriendo dentro de tmux, y no se detendrá aunque cierres la terminal o pierdas conexión.
+
+3. Para salir y dejarlo corriendo:
+Presiona Ctrl + B, luego suelta y presiona D
+Esto "desconecta" la sesión sin detenerla.
+
+4. Para volver a conectarte a la sesión después:
+bash
+Always show details
+
+Copy
+tmux attach -t lighthouse
+Si tienes más de una sesión y quieres ver la lista:
+
+bash
+Always show details
+
+Copy
+tmux ls
+🕒 Automatiza la ejecución todos los domingos a las 12:00 a.m. con cron
+Puedes programar el script para que se ejecute automáticamente cada domingo a medianoche (por si se reinicia la instancia o necesitas que se ejecute regularmente).
+
+1. Abre el editor de tareas programadas:
+bash
+Always show details
+
+Copy
+crontab -e
+2. Agrega esta línea al final del archivo:
+bash
+Always show details
+
+Copy
+0 0 * * 0 tmux new-session -d -s auto_lighthouse "cd /home/ec2-user/lighthouse-batch && /usr/bin/python3 script.py >> log.txt 2>&1"
+Explicación:
+0 0 * * 0 significa “a las 00:00 todos los domingos”
+El script se ejecuta dentro de tmux con una nueva sesión llamada auto_lighthouse
+
+3. Guarda y cierra el archivo
+Si estás usando nano, presiona: Ctrl + X, luego Y, luego Enter.
+
+✅ ¡Listo!
+Tu script ahora se ejecutará automáticamente cada domingo a las 12:00 a.m., y puedes mantenerlo siempre activo usando tmux.
+"""
+
+
