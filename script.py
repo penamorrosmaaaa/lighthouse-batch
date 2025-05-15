@@ -11,6 +11,7 @@ import subprocess
 import logging
 from oauth2client.service_account import ServiceAccountCredentials
 from lxml import etree
+import math
 
 # ----------------------------------------------------------------
 # Setup Logging
@@ -45,7 +46,25 @@ except Exception as e:
 today = datetime.datetime.today().strftime("%Y-%m-%d")
 
 # Solo evitamos repetir URLs dentro de esta corrida, no de semanas anteriores
+# Track URLs from previous runs in the sheet
+already_seen_urls = set()
+
+try:
+    past_rows = sheet.get_all_values()
+    for row in past_rows:
+        groups = len(row) // 9
+        for g in range(groups):
+            base = g * 9
+            url = row[base + 2].strip()
+            if url.startswith("http"):
+                already_seen_urls.add(url)
+    logger.info(f"Loaded {len(already_seen_urls)} previously seen URLs from the sheet")
+except Exception as e:
+    logger.error(f"Error loading past URLs: {e}")
+
+# Used in this current run only
 used_urls = set()
+
 
 # ----------------------------------------------------------------
 # HTTP Helpers
@@ -53,10 +72,10 @@ used_urls = set()
 # ----------------------------------------------------------------
 # HTTP Helpers (with longer waits & retries)
 # ----------------------------------------------------------------
-def safe_request(url, retries=5, delay=5, timeout=10):
+
+def safe_request(url, retries=7, delay=10, timeout=20):
     """
-    Try up to `retries` times, waiting `delay` seconds between attempts,
-    before giving up on fetching url.
+    Enhanced request with longer timeout, exponential backoff, and failure logging.
     """
     for attempt in range(1, retries + 1):
         try:
@@ -65,12 +84,25 @@ def safe_request(url, retries=5, delay=5, timeout=10):
                 logger.debug(f"[{attempt}/{retries}] Fetched {url}")
                 return resp
             else:
-                logger.warning(f"[{attempt}/{retries}] {url} returned {resp.status_code}")
+                logger.warning(f"[{attempt}/{retries}] {url} returned status {resp.status_code}")
         except Exception as e:
             logger.warning(f"[{attempt}/{retries}] Error fetching {url}: {e}")
-        time.sleep(delay)
+        
+        wait = delay * math.pow(1.5, attempt)
+        logger.info(f"Waiting {round(wait, 1)}s before retrying...")
+        time.sleep(wait)
+    
     logger.error(f"All {retries} attempts failed for {url}")
+    
+    # Save failed URL to file for retry later
+    try:
+        with open("failed_sitemaps.txt", "a") as f:
+            f.write(url + "\n")
+    except Exception as e:
+        logger.error(f"Couldn't write failed URL to file: {e}")
+    
     return None
+
 
 def fetch_xml_root(url, retries=5, delay=5):
     """
@@ -172,7 +204,7 @@ def get_as():
     """
     Parses the AS MRSS feeds:
      • Opinion feed for nota → <item><link>
-     • Video feed for video → <item><media:content url="…">
+     • Video feed for video → <item><link>
     """
     nota, video = [], []
 
@@ -188,20 +220,29 @@ def get_as():
                 nota.append(link.text.strip())
         logger.info(f"AS NOTA: found {len(nota)} URLs")
 
-    # 2) VIDEO: MRSS video feed
+    # 2) VIDEO: valid AS.com /videos/...-v/ links only
     video_feed = "https://feeds.as.com/mrss-s/list/as/site/as.com/video/"
     root_v = fetch_xml_root(video_feed)
     if root_v is None:
         logger.error("Failed to fetch AS video feed")
     else:
         ns = {"media": "http://search.yahoo.com/mrss/"}
-        for media in root_v.xpath("//item/media:content", namespaces=ns):
-            url = media.get("url")
-            if url:
-                video.append(url.strip())
-        logger.info(f"AS VIDEO: found {len(video)} URLs")
+        for item in root_v.xpath("//item"):
+            link = item.find("link")
+            if link is not None and link.text:
+                url = link.text.strip()
+                if (
+                    url.startswith("https://as.com/") and
+                    "/videos/" in url and
+                    url.endswith("-v/") and
+                    not any(blocked in url for blocked in ["youtube.com", "prisad.com", ".mp4", "vdmedia.as.com"])
+                ):
+                    video.append(url)
+
+        logger.info(f"AS VIDEO: found {len(video)} clean AS.com URLs")
 
     return nota, video
+
 
 
 def get_terra():
@@ -433,7 +474,7 @@ try:
 
                 if i < len(urls):
                     url = urls[i]
-                    if url not in used_urls:
+                    if url not in used_urls and url not in already_seen_urls:
                         row.extend([today, content_type, url] + [""] * 6)
                         used_urls.add(url)
                         any_url = True
@@ -523,6 +564,32 @@ def run_lighthouse(url, retries=3, delay=2):
     return None
 
 # ----------------------------------------------------------------
+# Retry-safe helpers for Sheets
+# ----------------------------------------------------------------
+def safe_update_cell(sheet, row, col, value, retries=3, delay=2):
+    for attempt in range(retries):
+        try:
+            sheet.update_cell(row, col, value)
+            return True
+        except Exception as e:
+            logger.warning(f"[{attempt + 1}/{retries}] Failed to update cell ({row},{col}): {e}")
+            time.sleep(delay)
+    logger.error(f"❌ Giving up on updating cell ({row},{col}) after {retries} tries")
+    return False
+
+def safe_delete_row(sheet, row, retries=3, delay=2):
+    for attempt in range(retries):
+        try:
+            sheet.delete_row(row)
+            return True
+        except Exception as e:
+            logger.warning(f"[{attempt + 1}/{retries}] Failed to delete row {row}: {e}")
+            time.sleep(delay)
+    logger.error(f"❌ Giving up on deleting row {row} after {retries} tries")
+    return False
+
+
+# ----------------------------------------------------------------
 # Full Lighthouse loop (real runs + sheet updates)
 # ----------------------------------------------------------------
 try:
@@ -530,6 +597,9 @@ try:
     logger.info(f"Found {len(all_rows)} rows to process for Lighthouse")
 
     for row_idx, row in enumerate(all_rows, start=1):
+        if not row or row[0].strip() != today:
+            continue  # Skip rows not from today
+
         groups = len(row) // 9
 
         for g in range(groups):
@@ -544,21 +614,27 @@ try:
 
                 if metrics:
                     try:
-                        # base+4 is the “Score” column in this group
-                        sheet.update_cell(row_idx, base + 4, metrics["score"])
-                        sheet.update_cell(row_idx, base + 5, metrics["cls"])
-                        sheet.update_cell(row_idx, base + 6, metrics["lcp"])
-                        sheet.update_cell(row_idx, base + 7, metrics["si"])
-                        sheet.update_cell(row_idx, base + 8, metrics["tbt"])
-                        sheet.update_cell(row_idx, base + 9, metrics["fcp"])
-                        logger.info(f"Updated metrics for row {row_idx}, group {g+1}")
-                    except Exception as e:
-                        logger.error(f"Failed to update metrics at row {row_idx}, group {g+1}: {e}")
-                else:
-                    logger.warning(f"Failed to get Lighthouse metrics for {url}")
+                        safe_update_cell(sheet, row_idx, base + 4, metrics["score"])
+                        safe_update_cell(sheet, row_idx, base + 5, metrics["cls"])
+                        safe_update_cell(sheet, row_idx, base + 6, metrics["lcp"])
+                        safe_update_cell(sheet, row_idx, base + 7, metrics["si"])
+                        safe_update_cell(sheet, row_idx, base + 8, metrics["tbt"])
+                        safe_update_cell(sheet, row_idx, base + 9, metrics["fcp"])
 
-                # throttle between runs
-                time.sleep(1)
+                        logger.info(f"✅ Updated metrics for row {row_idx}, group {g+1}")
+                    except Exception as e:
+                        logger.error(f"❌ Failed to update metrics at row {row_idx}, group {g+1}: {e}")
+                else:
+                    logger.warning(f"⛔ Lighthouse failed 3 times for: {url} — clearing cells {base+2} to {base+9} in row {row_idx}")
+            try:
+                for col in range(base + 2, base + 10):  # URL to FCP
+                    safe_update_cell(sheet, row_idx, col, "")
+                logger.info(f"🧹 Cleared Lighthouse cells for row {row_idx}, group {g+1}")
+            except Exception as e:
+                logger.error(f"❌ Failed to clear cells for row {row_idx}, group {g+1}: {e}")
+
+
+                time.sleep(1)  # Throttle between runs
 
     logger.info("✅ URLs written and Lighthouse tests completed.")
 except Exception as e:
