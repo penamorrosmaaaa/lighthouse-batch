@@ -27,16 +27,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ----------------------------------------------------------------
-# Clean zombie Chrome processes to prevent overload
-# ----------------------------------------------------------------
-try:
-    subprocess.run("pkill -f chrome", shell=True)
-    logger.info("🧹 Cleaned up previous Chrome processes.")
-except Exception as e:
-    logger.warning(f"⚠️ Failed to clean Chrome processes: {e}")
-
-
-# ----------------------------------------------------------------
 # Setup Google Sheets API
 # ----------------------------------------------------------------
 SHEET_NAME = "SITEMAPS.XML"
@@ -562,19 +552,16 @@ def run_lighthouse(url, retries=3, delay=2):
             subprocess.run([
                 "lighthouse", url,
                 "--quiet",
-                "--chrome-flags=--headless --disable-gpu --no-sandbox",
+                "--chrome-flags='--headless'",
                 "--output=json", "--output-path=report.json"
-            ], check=True, timeout=120)  # ⏱ enforce 2 min timeout
+            ], check=True)
             with open("report.json", "r") as f:
                 report = json.load(f)
             return extract_metrics(report)
-        except subprocess.TimeoutExpired:
-            logger.warning(f"⚠️ Lighthouse timeout on attempt {attempt + 1} for {url}")
         except Exception as e:
             logger.warning(f"Lighthouse attempt {attempt + 1} failed for {url}: {str(e)}")
-        time.sleep(delay)
+            time.sleep(delay)
     return None
-
 
 # ----------------------------------------------------------------
 # Retry-safe helpers for Sheets
@@ -608,19 +595,10 @@ def safe_delete_row(sheet, row, retries=3, delay=2):
 try:
     all_rows = sheet.get_all_values()
     logger.info(f"Found {len(all_rows)} rows to process for Lighthouse")
-    
-    max_tests = 25  # 🛑 limit to 25 tests max per day
-    completed = 0
-
 
     for row_idx, row in enumerate(all_rows, start=1):
         if not row or row[0].strip() != today:
             continue  # Skip rows not from today
-        
-        if completed >= max_tests:
-            logger.info("🛑 Max Lighthouse tests reached for today.")
-            break
-
 
         groups = len(row) // 9
 
@@ -635,8 +613,6 @@ try:
                 metrics = run_lighthouse(url, retries=3, delay=2)
 
                 if metrics:
-                    completed += 1
-
                     try:
                         safe_update_cell(sheet, row_idx, base + 4, metrics["score"])
                         safe_update_cell(sheet, row_idx, base + 5, metrics["cls"])
