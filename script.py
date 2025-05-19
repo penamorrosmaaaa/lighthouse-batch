@@ -53,7 +53,7 @@ used_urls = set()
 # ----------------------------------------------------------------
 # HTTP Helpers (with longer waits & retries)
 # ----------------------------------------------------------------
-def safe_request(url, retries=5, delay=5, timeout=10):
+def safe_request(url, retries=5, delay=5, timeout=20):
     """
     Try up to `retries` times, waiting `delay` seconds between attempts,
     before giving up on fetching url.
